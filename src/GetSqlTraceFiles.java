@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.List;
@@ -28,12 +29,19 @@ public class GetSqlTraceFiles {
     private static final String jMeterFileSuffix    ="_jmeter.csv";
     private static final String sqlTraceFileSuffix  =".trc";
     private static final String tkProfOutFileSuffix = ".out";
-    private static final String tkProfExec = "/usr/bin/tkprof";
+//    private static final String jMeterFilesPath = "/home/mmokhtar/Documents/ChatterFeeds/FollowV2/Trace/201402261326";
+//    private static final String sqlTraceFilesPath = "/home/mmokhtar/Documents/ChatterFeeds/FollowV2/TraceFiles";
+//    private static final String tkProfExec = "/usr/bin/tkprof";
+    private static final String tkProfExec = "/home/oracle/rdbms/product/11.2.0/dbhome_11204/bin/tkprof";
     private static final String allNonRecursiveStatementString = "OVERALL TOTALS FOR ALL NON-RECURSIVE STATEMENTS";
     private static final String allRecursiveStatementString = "OVERALL TOTALS FOR ALL RECURSIVE STATEMENTS";
+    private static final String planStartString ="Row Source Operation";
+    private static final String nonResursiveString = "Total NON-RECURSIVE";
+    private static final String recursiveString = "Total RECURSIVE";
+    private static final String planEndtring ="********************************************************************************";
     private static final String jmeterPerTestSummaryFileName = "SummaryPerJmeterTest.csv";
     private static final String jmeterGlobalSummaryFile = "SummaryGlobal.csv"; 
-    private static final String SummaryFileHeader = "JMeterFileName,jMeterTestName,jMetertestElapsedms,statementType,stmtId,packageName,procedureName,count,cpu,elapsed,disk,query,current,rows,jMetertestTimeStamp,sqlTraceLastModified,jMeterTestStartTimeStamp,jMeterTestEndTimeStamp,sqlTraceFile";
+    private static final String SummaryFileHeader = "JMeterFileName,jMeterTestName,jMetertestElapsedms,statementType,stmtId,packageName,procedureName,count,cpu,elapsed,disk,query,current,rows,jMetertestTimeStamp,sqlTraceLastModified,jMeterTestStartTimeStamp,jMeterTestEndTimeStamp,explainPlan,planHash,sqlTraceFile";
     public static File jmeterPerTestSummaryFile;
     public static File jmeterSummaryFile;
     public static BufferedWriter jmeterPerTestsummaryFileWriter;
@@ -251,6 +259,20 @@ public class GetSqlTraceFiles {
 		return jmList ;
     }
     
+    static boolean tryParseInt(String value)  
+    {  
+         try  
+         {  
+             Integer.parseInt(value);  
+             return true;  
+          } catch(NumberFormatException nfe)  
+          {  
+              return false;  
+          }  
+    }
+    
+    // This code is heavily tied to the schema of the tkprof file output
+    // Changes in output format will break the logic
     private static void parseTkprofFile(String tkProfFileName,String jMeterTestName,String jMeterFileName,int jMetertestElapsed,
     		long jMetertestTimeStamp,long sqlTraceLastModified,
     		long firstTimeStamp,long lastTimeStamp,BufferedWriter summaryFileWriter) throws Exception
@@ -266,6 +288,8 @@ public class GetSqlTraceFiles {
     		boolean matchBegin = false;
     		boolean matchAllNonRecursive = false;
     		boolean matchAllRecursive = false;
+    		boolean matchPlan = false;
+    		boolean parsedTotal = false;
     		String statementType = null;
     		String selectStatmentPrefix = null;
     		String beginStatmentPrefix = null;
@@ -278,27 +302,53 @@ public class GetSqlTraceFiles {
     		String query = null;
     		String current = null;
     		String rows = null;
-    		
+    		String explainPlanString = null;
+    		String explainPlanHash = null;
+    		int lastWhiteSpaceindex = -1;
+    		int planStepID = 0;
+    		int planTreeDepth=0;
+    		int indexer= 0;
+    		int lineNumber = 1;
 	    		while((s=br.readLine())!=null ){
 	    			
+	    			//System.out.println(s);
+	    			// Don't try parsing line like this :
+	    			//	BEGIN /* SFDCTRACE:2014-02-27 
 	    			if(s.contains("BEGIN /* SFDCTRACE"))
 	    			{
 	    				continue;
 	    			}
 	    			
-	    			if(Pattern.matches("SELECT.+.sql.+", s))
+	    			if ( lineNumber > 898)
+	    			{
+	    				System.out.println(s);
+	    			}
+	    			
+	    			// Try to get the package and procedure names from : 
+	    			// 	SELECT /*cOauth.sql:get_consumer_by_id_nc:910*/ oc.consumer_secret, oc.consumer_key, oc.app_name, oc.logo_url,
+	    			
+	    			if(Pattern.matches("(.*)SELECT.+.sql.+", s) || s.startsWith("SELECT "))
 	    			{
 	    				
 	    				matchSelect = true;
 	    				matchBegin = false;
 	    				matchAllNonRecursive = false;
 	    				matchAllRecursive = false;
+	    				parsedTotal = false;
 	    				packageName = null;
 	    				procedureName = null;
-	    				String sqlLine[] = s.split("/");
-	    				selectStatmentPrefix =sqlLine[1];
 	    				statementType = "SELECT";
-	    				if (selectStatmentPrefix.contains(":"))
+	    				if (s.contains("/"))
+	    				{
+		    				String sqlLine[] = s.split("/");
+		    				selectStatmentPrefix =sqlLine[1];
+	    				}
+	    				else
+	    				{
+	    					selectStatmentPrefix = null;
+	    				}
+	    				
+	    				if (selectStatmentPrefix != null &&  (selectStatmentPrefix.contains(":")))
 	    				{
 	    					String stmntnAr[] = selectStatmentPrefix.split(":");
 	    					if (stmntnAr.length  >= 2)
@@ -309,17 +359,20 @@ public class GetSqlTraceFiles {
 	    				}
 	    				else
 	    				{
-	    					packageName= s;
+	    					packageName= s.replace(",", ";");
 	    				}
 	    				stmtIndex++;
 	    			}
 	    			
+	    			// Try to get the package and procedure names from : 
+	    			// 	BEGIN :1 := cFeedData.get_news_feed(:2 ,:3 ,:4 ,:5 ,:6 ,:7 ,:8 ,:9 ,:10 ,:11 ,
 	    			if(s.contains("BEGIN "))
 	    			{
 	    				matchBegin = true;
 	    				matchSelect = false;
 	    				matchAllNonRecursive = false;
 	    				matchAllRecursive = false;
+	    				parsedTotal = false;
 	    				packageName = null;
 	    				procedureName = null;
 	    				statementType = "BEGIN";
@@ -345,31 +398,55 @@ public class GetSqlTraceFiles {
 	    				stmtIndex++;
 	    			}
 
+	    			// Parse the summary section for OVERALL TOTALS FOR ALL NON-RECURSIVE STATEMENTS
+	    			//	OVERALL TOTALS FOR ALL NON-RECURSIVE STATEMENTS
+	    			//	
+	    			//	call     count       cpu    elapsed       disk      query    current        rows
+	    			//	------- ------  -------- ---------- ---------- ---------- ----------  ----------
+	    			//	Parse      261      0.02       0.02          0          0          0           0
+	    			//	Execute    538      0.20       0.20          0        754          0           0
+	    			//	Fetch     1298      0.42       0.50         20      45886          0        6471
+	    			//	------- ------  -------- ---------- ---------- ---------- ----------  ----------
+	    			//	total     2097      0.65       0.73         20      46640          0        6471
 	    			if(s.contains(allNonRecursiveStatementString))
 	    			{
 	    				matchBegin = false;
 	    				matchSelect = false;
 	    				matchAllNonRecursive = true;
 	    				matchAllRecursive = false;
+	    				parsedTotal = false;
 	    				packageName = null;
 	    				procedureName = null;
-	    				statementType = "Total NON-RECURSIVE";
+	    				statementType = nonResursiveString;
 	    				stmtIndex = -1;
 	    			}
 	    			
-	    			if(s.contains(allRecursiveStatementString))
-	    			{
-	    				matchAllRecursive = true;
-	    				matchAllNonRecursive = false;
-	    				matchBegin = false;
-	    				matchSelect = false;
-	    				packageName = null;
-	    				procedureName = null;
-	    				statementType = "Total RECURSIVE";
 
-	    				stmtIndex = -1;
-	    			}
 	    			
+	    			// If there is a plan we should parse
+	    			// For 10G tkrpof this is the output
+	    			//	Rows     Row Source Operation
+	    			//	-------  ---------------------------------------------------
+	    			//	      1  PARTITION HASH SINGLE PARTITION: KEY KEY (cr=2 pr=0 pw=0 time=31 us)
+	    			//	      1   TABLE ACCESS BY LOCAL INDEX ROWID OAUTH_CONSUMER PARTITION: KEY KEY (cr=2 pr=0 pw=0 time=21 us)
+	    			//	      1    INDEX UNIQUE SCAN PKOAUTH_CONSUMER PARTITION: KEY KEY (cr=1 pr=0 pw=0 time=11 us)(object id 200888)
+	    			//
+	    			// For 11G tkrpof this is the output
+	    			// Rows (1st) Rows (avg) Rows (max)  Row Source Operation
+	    			// ---------- ---------- ----------  ---------------------------------------------------
+	    			//        200        200        200  COUNT STOPKEY (cr=9 pr=0 pw=0 time=1060 us)
+	    			//        200        200        200   VIEW  (cr=9 pr=0 pw=0 time=858 us)
+	    			//        200        200        200    SORT GROUP BY NOSORT (cr=9 pr=0 pw=0 time=656 us)
+	    			//        201        201        201     PARTITION HASH SINGLE PARTITION: KEY KEY (cr=9 pr=0 pw=0 time=238 us)
+	    			//        201        201        201      INDEX RANGE SCAN IENFD2_LUPD PARTITION: KEY KEY (cr=9 pr=0 pw=0 time=232 us)(object id 687451)
+	    			if(s.contains(planStartString))
+	    			{
+	    				matchPlan = true;
+	    				planStepID = 0;
+	    				explainPlanString = null;
+	    				explainPlanHash = null;
+	    				continue;
+	    			}
 	    			
 	    			if ((matchBegin || matchSelect || matchAllNonRecursive || matchAllRecursive) && s.contains("total"))
 	    			{
@@ -390,16 +467,147 @@ public class GetSqlTraceFiles {
 	    				query = statmentSummary[5];
 	    				current = statmentSummary[6];
 	    				rows = statmentSummary[7];
-	    				System.out.println(jMeterFileName + "," + jMeterTestName+ "," + tkProfFile.getName() + "," + statementType + "," + stmtIndex + "," + packageName + "," + procedureName + "," + count + "," + cpu + "," + elapsed + "," + disk + "," + query + "," +current+ "," +rows);
-	    				 SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS");
-	    				 String jMetertestTimeStamp2 = dateFormat.format(jMetertestTimeStamp);
-	    				 String sqlTraceLastModified2= dateFormat.format(sqlTraceLastModified);
-	    				 String firstTimeStamp2= dateFormat.format(firstTimeStamp);
-	    				 String lastTimeStamp2= dateFormat.format(lastTimeStamp);
-	    				summaryFileWriter.append(jMeterFileName + "," + jMeterTestName+ "," +jMetertestElapsed+ "," + statementType + "," + stmtIndex + "," + packageName + "," + procedureName + "," + count + "," + cpu + "," + elapsed + "," + disk + "," + query + "," +current+ "," +rows+"," + jMetertestTimeStamp+"," +sqlTraceLastModified+"," +firstTimeStamp+"," +lastTimeStamp+"," + tkProfFile.getName() + "\n");
-	    				//summaryFileWriter.append(jMeterFileName + "," + jMeterTestName+ "," +jMetertestElapsed+ "," + statementType + "," + stmtIndex + "," + packageName + "," + procedureName + "," + count + "," + cpu + "," + elapsed + "," + disk + "," + query + "," +current+ "," +rows+"," + jMetertestTimeStamp2+"," +sqlTraceLastModified2+"," +firstTimeStamp2+"," +lastTimeStamp2+"," + tkProfFile.getName() + "\n");
-	    				matchSelect = matchBegin = matchAllNonRecursive = matchAllRecursive = false;
+	    				System.out.println("1 " +jMeterFileName + "," + jMeterTestName+ "," + tkProfFile.getName() + "," + statementType + "," + stmtIndex + "," + packageName + "," + procedureName + "," + count + "," + cpu + "," + elapsed + "," + disk + "," + query + "," +current+ "," +rows);
+	    				SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS");
+	    				String jMetertestTimeStamp2 = dateFormat.format(jMetertestTimeStamp);
+	    				String sqlTraceLastModified2= dateFormat.format(sqlTraceLastModified);
+	    				String firstTimeStamp2= dateFormat.format(firstTimeStamp);
+	    				String lastTimeStamp2= dateFormat.format(lastTimeStamp);
+	    				//summaryFileWriter.append(jMeterFileName + "," + jMeterTestName+ "," +jMetertestElapsed+ "," + statementType + "," + stmtIndex + "," + packageName + "," + procedureName + "," + count + "," + cpu + "," + elapsed + "," + disk + "," + query + "," +current+ "," +rows+"," + jMetertestTimeStamp+"," +sqlTraceLastModified+"," +firstTimeStamp+"," +lastTimeStamp+"," + tkProfFile.getName() + "\n");
+	    				parsedTotal = true;
+	    	    		
+	    				// Now that we parsed the totals the plan strings should be cleared as
+	    				// we expect a new plan soon
+	    				explainPlanString = null;
+	    	    		explainPlanHash = null;
+	    				indexer++;
 	    			}
+	    			
+	     			// Now parse the explain plan
+	    			if((matchPlan == true) && s.length() > 1)
+	    			{
+	    				if(s.contains("----------"))
+	    				{
+	    					lastWhiteSpaceindex = s.lastIndexOf(' ') + 1;
+	    					continue;
+	    				}
+	    				
+	    				if(s.contains(planEndtring))
+	    				{
+	    					matchPlan = false;
+	    				}
+	    				
+	    				// Here we will have the actual text of the plan
+	    				// COUNT STOPKEY (cr=17 pr=0 pw=0 time=2330 us)
+	    				//  VIEW  (cr=17 pr=0 pw=0 time=2126 us)
+	    				//   SORT GROUP BY NOSORT (cr=17 pr=0 pw=0 time=1822 us)
+	    				//    PARTITION HASH SINGLE PARTITION: KEY KEY (cr=17 pr=0 pw=0 time=1104 us)
+	    				//     INDEX RANGE SCAN IENFD2_CDATE PARTITION: KEY KEY (cr=17 pr=0 pw=0 time=892 us)(object id 687416)
+	    				if(lastWhiteSpaceindex > 0)
+	    				{
+	    					// planStep will have the actual operation, now we need to count how many white spaces
+	    					// are there in the beginning of the string.
+	    					String planStep = null;
+	    					String sqlOperation = null;
+		    				planTreeDepth = 0;
+	    					
+	    					try
+	    					{
+	    						planStep = s.substring(lastWhiteSpaceindex);
+	    					}
+	    					catch (Exception e)
+	    					{
+	    						System.out.println(s + " " + lastWhiteSpaceindex);
+	    					}
+	    					
+	    					for (int i = 0; i < planStep.length();i++)
+	    					{
+	    						char currentChar = planStep.charAt(i);
+	    						if(currentChar == ' ')
+	    						{
+	    							planTreeDepth ++;
+	    						}
+	    						else
+	    						{
+	    							break;
+	    						}
+	    					}
+
+	    					// Now we need to strip out things like (cr=17 pr=0 pw=0 time=892 us)(object id 687416)
+	    					// so that the plan hashes matches.
+	    					if(planStep.contains("("))
+	    					{
+	    						sqlOperation =  (planStep.split("\\("))[0];
+	    					}
+	    					
+	    					String rowCountAtStep =  s.trim().split("\\s+")[0];
+	    					StringBuilder explainString = new StringBuilder("planStepID  "); 
+	    					StringBuilder explainHashString = new StringBuilder(planStepID);
+	    					explainString.append(planStepID);
+	    					explainString.append("|rowcount ");
+	    					explainString.append(rowCountAtStep);
+	    					explainString.append("|planTreeDepth ");
+	    					explainString.append(planTreeDepth);
+	    					explainHashString.append(planTreeDepth);
+	    					explainString.append("|");
+	    					explainString.append(planStep);
+	    					explainHashString.append(sqlOperation);
+	    					explainString.append("|");
+	    					explainPlanString += explainString.toString();
+	    					explainPlanHash +=explainHashString.toString();
+	    					
+	    					planStepID++;
+	    				}
+	    			}
+	    			
+	    			// Each statement in the tkprof file has the string below indicating end of info related to the current statements
+	    			//	200        200        200    SORT GROUP BY NOSORT (cr=9 pr=0 pw=0 time=656 us)
+	    			//	201        201        201     PARTITION HASH SINGLE PARTITION: KEY KEY (cr=9 pr=0 pw=0 time=238 us)
+	    		    //	201        201        201      INDEX RANGE SCAN IENFD2_LUPD PARTITION: KEY KEY (cr=9 pr=0 pw=0 time=232 us)(object id 687451)
+	    		     //	********************************************************************************
+	    			if((parsedTotal == true && (s.contains(planEndtring) || statementType == nonResursiveString  )))
+	    			{
+	    				matchPlan = false;
+	    				parsedTotal = false;
+	    				if(explainPlanHash != null)
+	    				{
+	    					explainPlanHash = explainPlanHash.replace("null","");
+	    					explainPlanString = explainPlanString.replace("null","");
+	    					byte[] bytesOfMessage = explainPlanHash.getBytes("UTF-8");
+	    					MessageDigest md = MessageDigest.getInstance("MD5");
+	    					byte[] planHashBytes = md.digest(bytesOfMessage);
+	    					explainPlanHash = planHashBytes.toString();
+	    				}
+	    				lastWhiteSpaceindex = -1;
+	    				System.out.println("2 " + jMeterFileName + "," + jMeterTestName+ "," + tkProfFile.getName() + "," + statementType + "," + stmtIndex + "," + packageName + "," + procedureName + "," + count + "," + cpu + "," + elapsed + "," + disk + "," + query + "," +current+ "," +rows);
+	    				summaryFileWriter.append(jMeterFileName + "," + jMeterTestName+ "," +jMetertestElapsed+ "," + statementType + "," + stmtIndex + "," + packageName + "," + procedureName + "," + count + "," + cpu + "," + elapsed + "," + disk + "," + query + "," +current+ "," +rows+"," + jMetertestTimeStamp+"," +sqlTraceLastModified+"," +firstTimeStamp+"," +lastTimeStamp+","+explainPlanString+"," +explainPlanHash+","+ tkProfFile.getName() + "\n");
+	    				matchSelect = matchBegin = matchAllNonRecursive = matchAllRecursive = matchPlan = false;
+	    			}
+	    			
+	    			// Parse the summary section for OVERALL TOTALS FOR ALL RECURSIVE STATEMENTS
+	    			//	OVERALL TOTALS FOR ALL RECURSIVE STATEMENTS
+	    			//	
+	    			//	call     count       cpu    elapsed       disk      query    current        rows
+	    			//	------- ------  -------- ---------- ---------- ---------- ----------  ----------
+	    			//	Parse      261      0.02       0.02          0          0          0           0
+	    			//	Execute    538      0.20       0.20          0        754          0           0
+	    			//	Fetch     1298      0.42       0.50         20      45886          0        6471
+	    			//	------- ------  -------- ---------- ---------- ---------- ----------  ----------
+	    			//	total     2097      0.65       0.73         20      46640          0        6471
+	    			if(s.contains(allRecursiveStatementString))
+	    			{
+	    				matchAllRecursive = true;
+	    				matchAllNonRecursive = false;
+	    				matchBegin = false;
+	    				matchSelect = false;
+	    				parsedTotal = false;
+	    				packageName = null;
+	    				procedureName = null;
+	    				statementType = recursiveString;
+	    				stmtIndex = -1;
+	    			}
+	    			
+	    			lineNumber++;
 	    		}
 	    		summaryFileWriter.flush();
     		br.close();
@@ -413,7 +621,7 @@ public class GetSqlTraceFiles {
     	
         if (sqlTraceFilesMatchingTimeStamp.length > 0)
         {
-        	System.out.println("File " + jMeterTraceFilesDirName + " has " + sqlTraceFilesMatchingTimeStamp.length + " matching trace files");
+        	//System.out.println("File " + jMeterTraceFilesDirName + " has " + sqlTraceFilesMatchingTimeStamp.length + " matching trace files");
         	File jMeterTraceFilesDir = new File(jMeterTraceFilesDirName);
         	// if the directory does not exist, create it
         	  if (!jMeterTraceFilesDir.exists()) {
@@ -527,7 +735,7 @@ public class GetSqlTraceFiles {
 						    Long lastTimeStamp = getNthTimeStampinJmeterFile(jMeterFiles[i],(long) lnr.getLineNumber() - 1);		
 						    
 						    // Find the list of Sql Trace file that are within secondsOffset from the modified time of the 
-						    System.out.println("JMeter file : " + jMeterFiles[i] + " Frist time stamp " + firstTimeStamp + " Last time stamp" + lastTimeStamp );
+						    //System.out.println("JMeter file : " + jMeterFiles[i] + " Frist time stamp " + firstTimeStamp + " Last time stamp" + lastTimeStamp );
 						    int elapsedTime = (int) (lastTimeStamp - firstTimeStamp);
 						    
 						    File[] sqlTraceFilesMatchingTimeStamp = getFilesWithinTimeRange(sqlTraceFiles,firstTimeStamp,lastTimeStamp);
@@ -537,7 +745,7 @@ public class GetSqlTraceFiles {
 						    
 						    //copySqlStraceFilesToDir(sqlTraceFilesMatchingTimeStamp,jMeterTraceFilesDirName);
 						    
-						    System.out.println("File " + jMeterFiles[i].getName() + " " + jMeterLastModifiedTime);
+						    //System.out.println("File " + jMeterFiles[i].getName() + " " + jMeterLastModifiedTime);
 						  
 					} catch (Exception e) {
 						// TODO Auto-generated catch block
